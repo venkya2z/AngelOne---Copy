@@ -1,0 +1,76 @@
+@import "tailwindcss";
+
+:root {
+  /* Professional Light Theme Palette */
+  --background: #F8FAFC;
+  /* Slate 50 (Light Gray) */
+  --foreground: #0F172A;
+  /* Slate 900 (Dark Navy) */
+  --card: #FFFFFF;
+  /* White */
+  --card-foreground: #0F172A;
+
+  --primary: #2563EB;
+  /* Royal Blue */
+  --primary-foreground: #FFFFFF;
+
+  --secondary: #E2E8F0;
+  /* Slate 200 */
+  --secondary-foreground: #1E293B;
+  /* Slate 800 */
+
+  --muted: #F1F5F9;
+  --muted-foreground: #64748B;
+
+  --accent: #F1F5F9;
+  --accent-foreground: #0F172A;
+
+  --success: #10B981;
+  /* Emerald */
+  --danger: #EF4444;
+  /* Red */
+  --warning: #F59E0B;
+  /* Amber */
+  --border: #CBD5E1;
+  /* Slate 300 */
+}
+
+@theme inline {
+  /* Light Theme - Professional & Readable */
+  --color-background: #f8f9fa;
+  --color-foreground: #1a1a1a;
+  /* Much darker for better readability */
+  --color-card: #ffffff;
+  --color-card-foreground: #1a1a1a;
+  --color-primary: #2563eb;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #4a5568;
+  /* Darker secondary text */
+  --color-secondary-foreground: #1a1a1a;
+  --color-muted: #f1f5f9;
+  --color-muted-foreground: #475569;
+  --color-accent: #dbeafe;
+  --color-accent-foreground: #1e3a8a;
+  --color-border: #e2e8f0;
+  --color-input: #e2e8f0;
+  --color-ring: #2563eb;
+  --color-success: #16a34a;
+  --color-danger: #dc2626;
+  --color-warning: #f59e0b;
+}
+
+@layer base {
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    @apply text-foreground font-semibold;
+  }
+}

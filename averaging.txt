@@ -1,0 +1,367 @@
+Audit: Add-Lot / Averaging Capability
+Verdict: The engine cannot safely add or average into an open position today. It is built as a single-position, one-shot entry system. Redis commands that look like a second entry are explicitly rejected.
+
+Current Architecture
+PUBLISH
+SUBSCRIBE
+ENTRY / EXIT only
+RESET_STATE
+Signal Generator
+charts_engine:signals
+SignalEngine
+StrategyEngine
+Paper / Live Executor
+Angel One API
+charts_engine:commands
+Component	Role
+backend/signal_engine.py
+Subscribes to charts_engine:signals; routes only ENTRY and EXIT
+backend/strategy_engine.py
+Orchestrates entry → P&L monitor → exit
+backend/risk_manager.py
+Lot sizing from confidence + available funds (fresh entry only)
+backend/pnl_monitor.py
+Target/stop/peak exits using entry_price × num_lots
+backend/executors/
+Paper (in-memory) or Live (Angel One) order placement
+Evidence: Add-Lot Is Blocked
+1. Active position blocks all new entries
+# 1. Validate: No active trade
+if self.has_active_position():
+    print("[StrategyEngine] ⚠️ Entry ignored: Active position exists")
+    return
+Any second Redis ENTRY while a trade is open is dropped.
+
+2. Redis router has no ADD handler
+if event_type == 'ENTRY':
+    asyncio.run_coroutine_threadsafe(
+        self.strategy_engine.on_entry_signal(signal), 
+        self.loop
+    )
+elif event_type == 'EXIT':
+    asyncio.run_coroutine_threadsafe(
+        self.strategy_engine.on_exit_signal(signal), 
+        self.loop
+    )
+else:
+    print(f"[SignalEngine] Unknown event_type: {event_type}")
+HOLD, WAIT, and any hypothetical ADD / SCALE_IN are ignored.
+
+3. Position model stores one fill, not a running average
+self.active_position = {
+    'orderid': order_id,
+    'tradingsymbol': order_params['tradingsymbol'],
+    'symbol': strike_info['symbol'],
+    'token': strike_info['token'],
+    'entry_price': actual_price,  # first fill only
+    'entry_time': time.time(),
+    'num_lots': num_lots,
+    'lot_size': strike_info['lot_size'],
+    'quantity': actual_qty,
+    ...
+}
+There is no fills[], no weighted-average helper, and no leg history.
+
+4. Schema documents only ENTRY / EXIT
+redis_signal_schema.md defines event_type as ENTRY or EXIT only — no add-lot contract.
+
+5. Upstream signal generator also enforces single trade
+From SIGNAL_GENERATOR_V2_REDIS_GUIDE.md:
+
+State machine only allows ENTRY when current_state == 'NULL'. Duplicate entries blocked even if Redis delivers messages twice.
+
+Even if the execution engine were extended, the external generator would not emit a second ENTRY while in-trade unless it is changed too.
+
+6. Manual API / UI have no add action
+POST /api/publish-signal accepts only BUY_CE, BUY_PE, EXIT.
+
+What Partially Works (If You Add the Feature)
+Area	Status
+Exit full scaled qty
+Works — exit sells active_position['quantity']
+Broker net qty aggregation (live)
+Broker merges adds automatically; bot state can drift
+Reconciliation averageprice
+Used when adopting orphan positions, not during adds
+RESET_STATE after exit
+Works — no change needed
+Risks and Gaps Today
+Risk	Detail
+State drift
+Paper executor keeps one dict per order_id; add would create a second position while active_position stays stale
+Wrong average price
+P&L and stops use first entry_price, not blended cost
+Race conditions
+_entry_in_progress blocks concurrent ENTRY; ADD needs its own lock and coordination with EXIT
+Direction mismatch
+ADD for opposite side (CE vs PE) must be rejected
+ATM drift
+Second ENTRY might pick a new ATM strike; ADD must require same token / tradingsymbol
+Fund double-counting
+RiskManager.calculate_num_lots() ignores existing exposure
+Live safety cap
+max_order_value (₹50k) may block larger add orders
+Partial fills
+80% fill rule applies per order; mid-scale inconsistency possible
+P&L monitor stale
+start_monitoring() runs once; scaled lots/targets not refreshed
+Reconciliation blind spot
+Uses broker_positions[0] only; multi-leg / qty mismatch risk
+Tick → P&L wiring
+on_market_tick() exists but is not called from main.py feed callback
+Implementation Plan: Robust Add-Lot via Redis
+Design Principles
+Separate signal type — do not overload ENTRY; use ADD_LOT (or SCALE_IN).
+Same contract only — add only when token / tradingsymbol matches active_position.
+Atomic state updates — update active_position only after confirmed fill.
+Idempotency — dedupe by signal_id or (ts, event_type, lots).
+Configurable caps — max adds per trade, max total lots, cooldown between adds.
+Full audit trail — log every leg for reconciliation and debugging.
+Phase 1: Redis Contract (Schema)
+Extend redis_signal_schema.md with a new event:
+
+{
+  "ts": 1705112400.12,
+  "iso": "2026-01-13T09:16:40+0530",
+  "event_type": "ADD_LOT",
+  "signal_id": "uuid-or-monotonic-id",
+  "instrument": "CE",
+  "lots": 1,
+  "reason": "AVERAGING_DOWN",
+  "regime": "HIGH",
+  "contract_token": "optional-explicit-token",
+  "tradingsymbol": "optional-explicit-symbol"
+}
+Field	Required	Purpose
+event_type
+Yes
+Must be ADD_LOT
+signal_id
+Yes
+Idempotency / dedup
+lots
+Yes (or quantity)
+How much to add
+instrument
+Yes
+CE / PE — must match open direction
+contract_token
+Optional
+Pin exact contract; reject if mismatch
+Channel choice: keep charts_engine:signals for symmetry with ENTRY/EXIT. Optionally add a dedicated charts_engine:execution channel for bot-only commands (manual adds, emergency scale) that bypass the signal generator state machine.
+
+Phase 2: SignalEngine Routing
+File: backend/signal_engine.py
+
+elif event_type == 'ADD_LOT':
+    asyncio.run_coroutine_threadsafe(
+        self.strategy_engine.on_add_lot_signal(signal),
+        self.loop
+    )
+Add dedup cache (TTL ~60s) keyed by signal_id to handle Redis redelivery.
+
+Phase 3: StrategyEngine — on_add_lot_signal()
+File: backend/strategy_engine.py
+
+Validation gate (strict)
+ADD_LOT received
+  ├─ No active_position?           → REJECT "ADD without position"
+  ├─ _modification_in_progress?    → REJECT or queue (max 1 pending)
+  ├─ _entry_in_progress?           → WAIT up to N ms, then reject
+  ├─ instrument != position.direction? → REJECT
+  ├─ explicit token/symbol mismatch?   → REJECT
+  ├─ lots <= 0?                    → REJECT
+  ├─ total_lots + lots > max_total_lots? → REJECT
+  ├─ add_count >= max_adds_per_trade?    → REJECT
+  └─ cooldown since last add?      → REJECT
+Execution flow
+Reuse existing contract from active_position (do not call find_atm_strike() again).
+Size via new RiskManager.calculate_add_lots(existing_position, requested_lots, current_ltp).
+Place BUY for lots × lot_size on same tradingsymbol / token.
+wait_for_fill() with same 80% partial-fill rule.
+Merge into position:
+new_avg = (old_qty * old_price + new_qty * new_price) / (old_qty + new_qty)
+active_position['entry_price'] = new_avg
+active_position['quantity'] += new_qty
+active_position['num_lots'] += added_lots
+active_position['fills'].append({order_id, price, qty, ts, reason})
+active_position['add_count'] = active_position.get('add_count', 0) + 1
+Call pnl_monitor.update_position(active_position) to refresh lots and average entry.
+Send add-fill email alert; append to trade leg log.
+Locking model
+Replace single _entry_in_progress with:
+
+_modification_in_progress  # covers ENTRY, ADD_LOT, EXIT
+EXIT during ADD: wait for ADD to finish (mirror current EXIT-during-ENTRY logic).
+
+Phase 4: RiskManager Extensions
+File: backend/risk_manager.py
+
+Add calculate_add_lots():
+
+def calculate_add_lots(self, position, requested_lots, option_price):
+    # usable_funds minus cost of existing position
+    existing_cost = position['entry_price'] * position['quantity']
+    remaining_usable = usable - existing_cost
+    # cap at requested_lots and config max_add_lots_per_signal
+    # return 0 if can't afford 1 lot
+Config additions (strategy_config.json):
+
+{
+  "add_lot_enabled": true,
+  "max_adds_per_trade": 3,
+  "max_total_lots": 6,
+  "add_lot_cooldown_seconds": 30,
+  "max_add_lots_per_signal": 2,
+  "add_lot_requires_same_contract": true
+}
+Phase 5: PnLMonitor Update
+File: backend/pnl_monitor.py
+
+Add update_position(position):
+
+Refresh entry_price, num_lots, quantity
+Optionally reset pnl_history / max_pnl_seen on add (configurable — reset avoids false peak triggers after scale-in)
+Recalculate total_target = pnl_target_per_lot * num_lots
+Phase 6: Executor Fixes
+Paper executor
+Problem: each BUY creates a separate positions[order_id] entry; exit only closes the original orderid.
+
+Fix:
+
+get_positions() returns aggregated net qty per symboltoken
+exit_position() sells total net qty across all legs for that token
+Or maintain primary_order_id plus leg_order_ids[] in active_position
+Live executor
+Broker already nets qty; after add, verify via get_positions() that netqty matches bot quantity
+Consider bypass_safety only for exits, not adds
+Revisit max_order_value for add orders (separate max_add_order_value or scale cap by remaining margin)
+Phase 7: Reconciliation Hardening
+File: backend/strategy_engine.py → reconcile_positions()
+
+After add-lot support:
+
+Compare bot quantity vs broker netqty (not just token match).
+If qty differs > 1 lot tolerance → alert and adopt broker averageprice + netqty.
+Do not run reconciliation mid-ADD unless force=True.
+Phase 8: Signal Generator Coordination
+Two options:
+
+Option	Pros	Cons
+A. Generator emits ADD_LOT
+Single source of truth; regime logic drives averaging
+Requires generator state machine change
+B. Bot-local channel only
+Faster to ship; manual / external algo can add without generator changes
+Generator still thinks single entry; no coordinated exit logic
+Recommended: Option A for production; Option B for paper testing first.
+
+Generator changes needed:
+
+New state e.g. IN_TRADE allows ADD_LOT (not ENTRY)
+Do not send RESET_STATE on add
+Track total_lots / add_count in generator state for consistency
+Phase 9: API, UI, and Observability
+Surface	Change
+POST /api/publish-signal
+Add ADD_LOT with lots param
+PaperDashboard.tsx
+"Add 1 Lot" button (disabled when flat)
+email_alerter.py
+send_add_lot_alert()
+Trade log
+Per-leg JSONL: {event, order_id, price, qty, avg_after, signal_id}
+Redis command ack (optional)
+Publish ADD_LOT_ACK / ADD_LOT_REJECT on charts_engine:execution:acks
+Phase 10: Pre-Existing Bug Fix (Required for Safe P&L Exits)
+Wire StrategyEngine.on_market_tick() from the feed callback in main.py. Without this, P&L-based exits after scaling may never fire even when enabled in config.
+
+Suggested Rollout Order
+⚠️
+Mermaid Syntax Error
+Paper only — implement ADD_LOT + manual API; test averaging math and exit qty.
+Reconciliation tests — simulate broker qty drift after adds.
+Live shadow — log add decisions without placing (or 1-lot cap).
+Generator integration — enable coordinated ADD_LOT from upstream.
+Production — enable with strict caps (max_adds_per_trade: 2, max_total_lots: 5).
+Test Matrix (Must Pass Before Live)
+Scenario	Expected
+ADD while flat
+Reject
+ADD same CE, 1 lot
+Avg price updated, qty += lot_size
+ADD opposite PE while holding CE
+Reject
+Duplicate signal_id
+Ignored (idempotent)
+ADD during EXIT
+EXIT waits or ADD rejected (config)
+Partial fill < 80% on add
+Reject leg; position unchanged
+Exit after 2 adds
+Sells total qty; P&L uses blended avg
+Reconciliation after add
+Bot qty matches broker netqty
+Exceed max_total_lots
+Reject
+Insufficient margin for add
+Reject with alert
+Summary
+Question	Answer
+Can it add/average today?
+No — blocked at entry validation, no Redis handler, no position merge logic
+Is the foundation reusable?
+Yes — executors, fill confirmation, exit, and reconciliation can be extended
+Biggest work items
+New ADD_LOT signal path, weighted-average position model, risk caps, paper position merge, generator coordination
+Biggest safety risks
+State drift, wrong average price, race with EXIT, fund over-commitment
+I can start implementing Phase 1–3 (schema, SignalEngine routing, on_add_lot_signal) in paper mode first if you want to proceed.
+
+the lot size is already decided in settings as per confidence low,medium,high righ?
+
+Yes — at initial entry, lot count comes from settings keyed by confidence, not from the Redis signal itself.
+
+How it works today
+1. Config maps confidence → lots
+
+"confidence_num_lots": {
+  "HIGH": 3,
+  "MEDIUM": 2,
+  "LOW": 1
+},
+2. Entry reason → confidence
+
+CONFIDENCE_MAP = {
+    "OPPOSITION_ENTRY": "HIGH",
+    "ALIGNMENT_ENTRY": "MEDIUM",
+    "CUMULATIVE_ENTRY": "LOW"
+}
+Manual entries (MANUAL_ENTRY) fall back to LOW (1 lot) because they aren’t in that map.
+
+3. Risk manager applies config + funds
+
+confidence_map = self.config.get("confidence_num_lots", {"HIGH": 5, "MEDIUM": 3, "LOW": 1})
+desired_num_lots = confidence_map.get(confidence, 1)
+...
+for num_lots in range(desired_num_lots, 0, -1):
+    total_cost = cost_per_lot * num_lots
+    if total_cost <= usable:
+        return num_lots
+So the flow is:
+
+ENTRY signal reason → confidence (HIGH/MEDIUM/LOW) → desired lots from config → capped by available funds
+Example with your current settings and enough margin:
+
+OPPOSITION_ENTRY → HIGH → 3 lots
+ALIGNMENT_ENTRY → MEDIUM → 2 lots
+CUMULATIVE_ENTRY → LOW → 1 lot
+What this means for add-lot / averaging
+Lot size is decided once at entry; there is no add-lot path today.
+Redis ENTRY does not carry a lots field — only the reason (and thus confidence) drives sizing.
+For a future ADD_LOT, you’d need to choose:
+Same rule — add the same count as entry confidence (e.g. HIGH → +3), or
+Fixed add — e.g. always +1 per ADD_LOT, or
+Explicit in signal — lots: 1 in the Redis message.
+If you want adds to follow the same confidence settings, the natural rule would be: each ADD_LOT adds confidence_num_lots[confidence] again, still subject to max_total_lots and remaining margin.
+
